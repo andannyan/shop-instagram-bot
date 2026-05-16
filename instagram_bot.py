@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """
 Instagram Auto-Posting Bot with Telegram Approval
 Schedule: Tuesday & Friday 10:00 BKK (UTC+7)
