@@ -1,26 +1,27 @@
 #!/usr/bin/env python3
 """
 Instagram Auto-Posting Bot with Telegram Approval
-==================================================
 Schedule: Tuesday & Friday 10:00 BKK (UTC+7)
 
 Flow:
   generate → Telegram preview → [✅ Post] [♻️ Redo] [⏭ Skip]
-  ♻️ → user types feedback → regenerate → new preview
+  ♻️ Redo → user types feedback → regenerate → new preview
+  ✅ Approve → post to Instagram
 
 Env vars required:
   SUPABASE_URL, SUPABASE_SERVICE_KEY
-  INSTAGRAM_BOT_TOKEN     ← separate bot from nekiagent!
-  TELEGRAM_USER_ID        ← owner's Telegram ID (7255533143)
-  DEEPSEEK_API_KEY        ← for captions (falls back to OpenAI)
-  OPENAI_API_KEY          ← for captions fallback + DALL-E 3 images
+  INSTAGRAM_BOT_TOKEN     ← Telegram bot (separate from nekiagent)
+  TELEGRAM_USER_ID        ← owner ID (7255533143)
+  DEEPSEEK_API_KEY        ← captions (deepseek-chat)
+  GOOGLE_API_KEY          ← image generation (Google Imagen 3)
 
-Env vars optional (Instagram posting):
+Env vars optional:
   INSTAGRAM_ACCESS_TOKEN
   INSTAGRAM_BUSINESS_ACCOUNT_ID
 """
 
 import asyncio
+import base64
 import os
 import random
 import logging
@@ -40,23 +41,21 @@ log = logging.getLogger(__name__)
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-SUPABASE_URL      = os.getenv("SUPABASE_URL", "")
-SUPABASE_KEY      = os.getenv("SUPABASE_SERVICE_KEY", "")
-OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY", "")
-DEEPSEEK_API_KEY  = os.getenv("DEEPSEEK_API_KEY", "")
-TG_TOKEN          = os.getenv("INSTAGRAM_BOT_TOKEN", "")
-TG_OWNER_ID       = int(os.getenv("TELEGRAM_USER_ID", "7255533143"))
-IG_ACCESS_TOKEN   = os.getenv("INSTAGRAM_ACCESS_TOKEN", "")
-IG_ACCOUNT_ID     = os.getenv("INSTAGRAM_BUSINESS_ACCOUNT_ID", "")
+SUPABASE_URL     = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY     = os.getenv("SUPABASE_SERVICE_KEY", "")
+DEEPSEEK_KEY     = os.getenv("DEEPSEEK_API_KEY", "")
+GOOGLE_KEY       = os.getenv("GOOGLE_API_KEY", "")
+TG_TOKEN         = os.getenv("INSTAGRAM_BOT_TOKEN", "")
+TG_OWNER_ID      = int(os.getenv("TELEGRAM_USER_ID", "7255533143"))
+IG_ACCESS_TOKEN  = os.getenv("INSTAGRAM_ACCESS_TOKEN", "")
+IG_ACCOUNT_ID    = os.getenv("INSTAGRAM_BUSINESS_ACCOUNT_ID", "")
 
 BKK = ZoneInfo("Asia/Bangkok")
 
 # ─── State ────────────────────────────────────────────────────────────────────
 
 sb: Client = None
-
-# Pending post waiting for approval
-pending: dict = {}
+pending: dict = {}          # post waiting for Telegram approval
 tg_offset: int = 0
 last_posted_date: str = ""
 
@@ -65,68 +64,99 @@ last_posted_date: str = ""
 def init_supabase():
     global sb
     sb = create_client(SUPABASE_URL, SUPABASE_KEY)
-    log.info("Supabase initialized")
+    log.info("Supabase ready")
 
-# ─── Image Generation (DALL-E 3) ──────────────────────────────────────────────
-
-async def generate_image(prompt: str) -> str | None:
-    if not OPENAI_API_KEY:
-        log.warning("No OPENAI_API_KEY — skipping image generation")
-        return None
+def upload_image_to_storage(image_bytes: bytes) -> str | None:
+    """Upload image bytes to Supabase Storage, return public URL"""
     try:
-        async with httpx.AsyncClient() as client:
-            r = await client.post(
-                "https://api.openai.com/v1/images/generations",
-                headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-                json={
-                    "model": "dall-e-3",
-                    "prompt": prompt + ", high quality, Instagram-ready, no text overlay",
-                    "n": 1,
-                    "size": "1024x1024",
-                },
-                timeout=90,
-            )
-            r.raise_for_status()
-            url = r.json()["data"][0]["url"]
-            log.info(f"Image generated")
-            return url
+        filename = f"post_{datetime.now(BKK).strftime('%Y%m%d_%H%M%S')}.png"
+        sb.storage.from_("instagram").upload(
+            path=filename,
+            file=image_bytes,
+            file_options={"content-type": "image/png"},
+        )
+        url = sb.storage.from_("instagram").get_public_url(filename)
+        log.info(f"Image uploaded: {filename}")
+        return url
     except Exception as e:
-        log.error(f"Image generation failed: {e}")
+        log.error(f"Storage upload failed: {e}")
         return None
 
-# ─── Caption Generation ───────────────────────────────────────────────────────
+# ─── Image Generation (Google Imagen 3) ───────────────────────────────────────
+
+async def generate_image(prompt: str) -> tuple[bytes | None, str | None]:
+    """
+    Generate image via Google Imagen 3 API.
+    Returns (image_bytes, public_supabase_url) or (None, None) on failure.
+    """
+    if not GOOGLE_KEY:
+        log.warning("No GOOGLE_API_KEY — skipping image generation")
+        return None, None
+    try:
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"imagen-3.0-generate-002:predict?key={GOOGLE_KEY}"
+        )
+        payload = {
+            "instances": [{"prompt": prompt + ", high quality, Instagram-ready, no text overlay"}],
+            "parameters": {
+                "sampleCount": 1,
+                "aspectRatio": "1:1",
+                "safetyFilterLevel": "BLOCK_ONLY_HIGH",
+                "personGeneration": "ALLOW_ADULT",
+            },
+        }
+        async with httpx.AsyncClient() as client:
+            r = await client.post(url, json=payload, timeout=90)
+            r.raise_for_status()
+            b64 = r.json()["predictions"][0]["bytesBase64Encoded"]
+            image_bytes = base64.b64decode(b64)
+            log.info("Image generated via Google Imagen 3")
+
+        public_url = upload_image_to_storage(image_bytes)
+        return image_bytes, public_url
+
+    except Exception as e:
+        log.error(f"Google Imagen failed: {e}")
+        return None, None
+
+# ─── Caption Generation (DeepSeek) ───────────────────────────────────────────
 
 SYSTEM_PROMPTS = {
     "meme": (
         "You are a meme creator for Lighthouse — a premium cannabis shop on Koh Samui, Thailand.\n"
         "Write SHORT, punchy Instagram captions:\n"
-        "- Break the 'weed = lazy' stereotype. Show athletes, creatives, productive people.\n"
+        "- Break the 'weed = lazy' stereotype — show athletes, creatives, productive people who also enjoy cannabis\n"
         "- Format: funny setup + punchline\n"
         "- 1–3 sentences MAX, 2–3 emojis\n"
         "- Hashtags at the end (use the ones provided)\n"
-        "Style: witty, modern, not cringe. Write in English."
+        "Style: witty, modern, not cringe. English only."
     ),
     "active": (
         "You are a content creator for Lighthouse — a premium cannabis shop on Koh Samui, Thailand.\n"
         "Write inspiring captions about cannabis + active lifestyle:\n"
-        "- Audience: athletes, yogis, swimmers, runners, gym-goers\n"
-        "- Cannabis enhances focus, recovery, enjoyment of physical activity\n"
-        "- Energetic, motivating tone\n"
-        "- 2–3 sentences, 3–4 emojis, hashtags at the end\n"
-        "Write in English."
+        "- Audience: athletes, yogis, swimmers, runners, gym-goers who enjoy cannabis\n"
+        "- Show cannabis enhances focus, recovery, enjoyment of physical activity\n"
+        "- Energetic, motivating tone. 2–3 sentences, 3–4 emojis\n"
+        "- Hashtags at the end (use the ones provided)\n"
+        "English only."
     ),
     "educational": (
         "You are an educational content creator for Lighthouse — a premium cannabis shop on Koh Samui, Thailand.\n"
         "Write informative Instagram captions:\n"
-        "- Teach one specific thing about cannabis (strains, effects, science, tips)\n"
+        "- Teach one specific thing about cannabis (strains, effects, terpenes, tips)\n"
         "- Clear for beginners, interesting for enthusiasts\n"
-        "- Builds brand trust and authority\n"
-        "- 3–4 sentences with real facts, 2–3 emojis, hashtags at the end\n"
-        "Write in English."
+        "- Builds brand trust. 3–4 sentences with real facts, 2–3 emojis\n"
+        "- Hashtags at the end (use the ones provided)\n"
+        "English only."
     ),
 }
 
 async def generate_caption(theme: dict, feedback: str = "") -> str:
+    if not DEEPSEEK_KEY:
+        log.error("No DEEPSEEK_API_KEY")
+        return theme.get("description", "")
+
     category = theme.get("category", "educational")
     system = SYSTEM_PROMPTS.get(category, SYSTEM_PROMPTS["educational"])
 
@@ -136,51 +166,33 @@ async def generate_caption(theme: dict, feedback: str = "") -> str:
         f"Hashtags to include: {theme['hashtags']}"
     )
     if feedback:
-        user_msg += f"\n\nPREVIOUS VERSION WAS REJECTED. Feedback: {feedback}\nRewrite accordingly."
+        user_msg += f"\n\nPREVIOUS VERSION REJECTED. Feedback: {feedback}\nRewrite accordingly."
 
-    messages = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user_msg},
-    ]
-    payload = {"messages": messages, "temperature": 0.9, "max_tokens": 250}
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.post(
+                "https://api.deepseek.com/chat/completions",
+                headers={"Authorization": f"Bearer {DEEPSEEK_KEY}"},
+                json={
+                    "model": "deepseek-chat",
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user",   "content": user_msg},
+                    ],
+                    "temperature": 0.9,
+                    "max_tokens": 250,
+                },
+                timeout=30,
+            )
+            r.raise_for_status()
+            caption = r.json()["choices"][0]["message"]["content"].strip()
+            log.info("Caption generated via DeepSeek")
+            return caption
+    except Exception as e:
+        log.error(f"DeepSeek failed: {e}")
+        return theme.get("description", "")
 
-    # Try DeepSeek first
-    if DEEPSEEK_API_KEY:
-        try:
-            async with httpx.AsyncClient() as client:
-                r = await client.post(
-                    "https://api.deepseek.com/chat/completions",
-                    headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}"},
-                    json={**payload, "model": "deepseek-chat"},
-                    timeout=30,
-                )
-                r.raise_for_status()
-                caption = r.json()["choices"][0]["message"]["content"].strip()
-                log.info("Caption via DeepSeek")
-                return caption
-        except Exception as e:
-            log.error(f"DeepSeek failed: {e}")
-
-    # Fallback: OpenAI
-    if OPENAI_API_KEY:
-        try:
-            async with httpx.AsyncClient() as client:
-                r = await client.post(
-                    "https://api.openai.com/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-                    json={**payload, "model": "gpt-4o-mini"},
-                    timeout=30,
-                )
-                r.raise_for_status()
-                caption = r.json()["choices"][0]["message"]["content"].strip()
-                log.info("Caption via OpenAI (fallback)")
-                return caption
-        except Exception as e:
-            log.error(f"OpenAI also failed: {e}")
-
-    return theme.get("description", "No caption generated")
-
-# ─── Telegram Helpers ─────────────────────────────────────────────────────────
+# ─── Telegram ─────────────────────────────────────────────────────────────────
 
 async def tg(method: str, **kwargs) -> dict:
     async with httpx.AsyncClient() as client:
@@ -191,6 +203,22 @@ async def tg(method: str, **kwargs) -> dict:
         )
         return r.json()
 
+async def tg_send_photo_bytes(image_bytes: bytes, caption: str, keyboard: dict) -> int | None:
+    """Send photo from bytes (not URL) to Telegram"""
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto",
+            data={
+                "chat_id": str(TG_OWNER_ID),
+                "caption": caption[:1024],
+                "parse_mode": "HTML",
+                "reply_markup": __import__("json").dumps(keyboard),
+            },
+            files={"photo": ("post.png", image_bytes, "image/png")},
+            timeout=60,
+        )
+        return r.json().get("result", {}).get("message_id")
+
 CAT_EMOJI = {"meme": "😂", "active": "🏃", "educational": "📚"}
 
 KEYBOARD = {"inline_keyboard": [[
@@ -199,7 +227,8 @@ KEYBOARD = {"inline_keyboard": [[
     {"text": "⏭ Пропустить",   "callback_data": "skip"},
 ]]}
 
-async def send_preview(theme: dict, caption: str, image_url: str | None) -> int | None:
+async def send_preview(theme: dict, caption: str,
+                       image_bytes: bytes | None, image_url: str | None) -> int | None:
     emoji = CAT_EMOJI.get(theme["category"], "📸")
     text = (
         f"{emoji} <b>Instagram Preview</b>\n\n"
@@ -208,33 +237,24 @@ async def send_preview(theme: dict, caption: str, image_url: str | None) -> int 
         f"<b>Caption:</b>\n{caption}"
     )
 
-    if image_url:
-        r = await tg("sendPhoto",
-            chat_id=TG_OWNER_ID,
-            photo=image_url,
-            caption=text[:1024],
-            parse_mode="HTML",
-            reply_markup=KEYBOARD,
-        )
-    else:
-        text += "\n\n⚠️ <i>Картинка не сгенерирована (нет OPENAI_API_KEY)</i>"
-        r = await tg("sendMessage",
-            chat_id=TG_OWNER_ID,
-            text=text,
-            parse_mode="HTML",
-            reply_markup=KEYBOARD,
-        )
+    if image_bytes:
+        return await tg_send_photo_bytes(image_bytes, text, KEYBOARD)
 
+    # No image — send text only
+    text += "\n\n⚠️ <i>Картинка не сгенерирована</i>"
+    r = await tg("sendMessage",
+        chat_id=TG_OWNER_ID,
+        text=text,
+        parse_mode="HTML",
+        reply_markup=KEYBOARD,
+    )
     return r.get("result", {}).get("message_id")
 
 # ─── Instagram Posting ────────────────────────────────────────────────────────
 
 async def post_to_instagram(caption: str, image_url: str) -> str | None:
     if not IG_ACCESS_TOKEN or not IG_ACCOUNT_ID:
-        log.warning("Instagram credentials not set")
-        return None
-    if not image_url:
-        log.warning("No image URL — cannot post to Instagram")
+        log.warning("Instagram credentials not configured")
         return None
     try:
         base = f"https://graph.instagram.com/v18.0/{IG_ACCOUNT_ID}"
@@ -245,10 +265,9 @@ async def post_to_instagram(caption: str, image_url: str) -> str | None:
                 "access_token": IG_ACCESS_TOKEN,
             }, timeout=30)
             r.raise_for_status()
-            container_id = r.json()["id"]
 
             r2 = await client.post(f"{base}/media_publish", json={
-                "creation_id": container_id,
+                "creation_id": r.json()["id"],
                 "access_token": IG_ACCESS_TOKEN,
             }, timeout=30)
             r2.raise_for_status()
@@ -278,35 +297,34 @@ def log_post(theme_id: int, caption: str, image_url: str | None,
 async def run_post_workflow(feedback: str = ""):
     global pending
 
-    # Keep same theme on redo, pick new on fresh run
+    # On redo keep same theme, on fresh pick random
     if feedback and pending.get("theme"):
         theme = pending["theme"]
     else:
         res = sb.table("instagram_content").select("*").eq("is_active", True).execute()
         themes = res.data
         if not themes:
-            log.error("No active themes in instagram_content")
             await tg("sendMessage", chat_id=TG_OWNER_ID,
                      text="❌ Нет активных тем в instagram_content!")
             return
         theme = random.choice(themes)
 
-    log.info(f"Workflow: theme='{theme['theme']}' feedback='{feedback or 'none'}'")
+    log.info(f"Workflow: '{theme['theme']}' | feedback: '{feedback or 'none'}'")
 
     caption = await generate_caption(theme, feedback)
-    image_url = await generate_image(theme["prompt"])
+    image_bytes, image_url = await generate_image(theme["prompt"])
 
-    msg_id = await send_preview(theme, caption, image_url)
+    msg_id = await send_preview(theme, caption, image_bytes, image_url)
 
-    pending = {
+    pending.update({
         "theme": theme,
         "caption": caption,
         "image_url": image_url,
         "message_id": msg_id,
         "awaiting_feedback": False,
-    }
+    })
 
-# ─── Callback Handlers ────────────────────────────────────────────────────────
+# ─── Callback & Message Handlers ─────────────────────────────────────────────
 
 async def handle_callback(cb: dict):
     global pending
@@ -322,36 +340,40 @@ async def handle_callback(cb: dict):
     await tg("answerCallbackQuery", callback_query_id=cb_id)
 
     if data == "approve":
-        ig_id = await post_to_instagram(pending["caption"], pending["image_url"])
+        if pending.get("image_url"):
+            ig_id = await post_to_instagram(pending["caption"], pending["image_url"])
+        else:
+            ig_id = None
+
         if ig_id:
             log_post(pending["theme"]["id"], pending["caption"],
                      pending["image_url"], ig_id, "published")
             await tg("sendMessage", chat_id=TG_OWNER_ID,
-                     text=f"✅ <b>Опубликовано!</b>\nInstagram post ID: <code>{ig_id}</code>",
+                     text=f"✅ <b>Опубликовано в Instagram!</b>\nPost ID: <code>{ig_id}</code>",
                      parse_mode="HTML")
         else:
             log_post(pending["theme"]["id"], pending["caption"],
-                     pending["image_url"], None, "approved_no_ig")
+                     pending["image_url"], None, "approved_manual")
             await tg("sendMessage", chat_id=TG_OWNER_ID,
-                     text="⚠️ Instagram не настроен. Caption сохранён в логе.\n\n"
-                          f"<b>Caption для ручного поста:</b>\n{pending['caption']}",
+                     text=(
+                         "⚠️ Instagram не настроен — пост сохранён.\n\n"
+                         f"<b>Caption для ручной публикации:</b>\n{pending['caption']}"
+                     ),
                      parse_mode="HTML")
-        pending = {}
+        pending.clear()
 
     elif data == "redo":
         pending["awaiting_feedback"] = True
         await tg("sendMessage", chat_id=TG_OWNER_ID,
-                 text="✍️ Что переделать? Напиши комментарий (например: «сделай смешнее» / «другой тон» / «измени хэштеги»):")
+                 text="✍️ Что переделать? Напиши комментарий:\n(например: «сделай смешнее», «другой тон», «убери хэштеги», «новая картинка»)")
 
     elif data == "skip":
         log_post(pending["theme"]["id"], pending["caption"],
                  pending["image_url"], None, "skipped")
         await tg("sendMessage", chat_id=TG_OWNER_ID, text="⏭ Пост пропущен")
-        pending = {}
+        pending.clear()
 
 async def handle_message(msg: dict):
-    global pending
-
     if not pending or not pending.get("awaiting_feedback"):
         return
 
@@ -361,30 +383,25 @@ async def handle_message(msg: dict):
 
     pending["awaiting_feedback"] = False
     await tg("sendMessage", chat_id=TG_OWNER_ID,
-             text=f"♻️ Переделываю с учётом: «{feedback}»...\nПодожди ~30 сек")
+             text=f"♻️ Переделываю с учётом: «{feedback}»...\nПодожди ~40 сек")
     await run_post_workflow(feedback=feedback)
 
-# ─── Telegram Polling Loop ────────────────────────────────────────────────────
+# ─── Polling Loop ─────────────────────────────────────────────────────────────
 
 async def telegram_polling_loop():
     global tg_offset
     log.info("Telegram polling started")
-
     while True:
         try:
-            r = await tg("getUpdates",
-                offset=tg_offset,
-                timeout=25,
-                allowed_updates=["message", "callback_query"],
-            )
+            r = await tg("getUpdates", offset=tg_offset, timeout=25,
+                         allowed_updates=["message", "callback_query"])
             for upd in r.get("result", []):
                 tg_offset = upd["update_id"] + 1
                 if "callback_query" in upd:
                     await handle_callback(upd["callback_query"])
                 elif "message" in upd:
                     msg = upd["message"]
-                    from_id = msg.get("from", {}).get("id")
-                    if from_id == TG_OWNER_ID and "text" in msg:
+                    if msg.get("from", {}).get("id") == TG_OWNER_ID and "text" in msg:
                         await handle_message(msg)
         except Exception as e:
             log.error(f"Polling error: {e}")
@@ -394,18 +411,16 @@ async def telegram_polling_loop():
 
 def is_posting_time() -> bool:
     now = datetime.now(BKK)
-    # Tuesday=1, Friday=4, 10:00–10:04 BKK
     return now.weekday() in (1, 4) and now.hour == 10 and now.minute < 5
 
 async def schedule_loop():
     global last_posted_date
     log.info("Schedule loop started (Tue/Fri 10:00 BKK)")
-
     while True:
         try:
             today = datetime.now(BKK).strftime("%Y-%m-%d")
             if is_posting_time() and last_posted_date != today and not pending:
-                log.info("⏰ Posting time — generating content")
+                log.info("⏰ Posting time!")
                 last_posted_date = today
                 await run_post_workflow()
         except Exception as e:
@@ -434,8 +449,8 @@ def health():
 
 @app.post("/post/now")
 async def force_post():
-    """Manual trigger — for testing without waiting for schedule"""
+    """Manual trigger for testing — generates post and sends to Telegram for approval"""
     if pending:
-        return {"error": "Already have pending post waiting for approval"}
+        return {"error": "Already have pending post — check Telegram"}
     asyncio.create_task(run_post_workflow())
-    return {"status": "generating — check Telegram in ~30 sec"}
+    return {"status": "generating — check Telegram in ~40 sec"}
